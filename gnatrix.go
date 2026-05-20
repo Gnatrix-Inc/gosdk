@@ -132,6 +132,23 @@ func (e *AuthError) Error() string {
 // QueryStream live in query.go.
 
 // QueryOptions configures a Client.Query call.
+//
+// All fields are optional. Zero-value semantics:
+//
+//	IndexName == ""             → server applies "default"
+//	Limit == 0                  → no cap; server streams every match
+//	Cursor == ""                → fresh query (no pagination resume)
+//	TimeRange == nil            → server's default window (15m ending now,
+//	                              configurable per tenant)
+//	ProgressIntervalMs == 0     → server's default progress cadence (250ms)
+//
+// TimeRange is the only cross-field invariant: when non-nil, both
+// EarliestNs and LatestNs must be set (the SDK trusts the caller; the
+// server rejects latest < earliest with ERROR 2013 QueryInvalidTimeRange).
+// To paginate, copy QueryResult.NextCursor from a prior successful
+// query into Cursor on the next call.
+//
+// QueryOptions is value-typed; an empty zero value is a valid call.
 type QueryOptions struct {
 	// IndexName names the target index, e.g. "logs-2026". Empty defaults
 	// to "default" at the Query call site.
@@ -153,9 +170,27 @@ type QueryOptions struct {
 	ProgressIntervalMs uint32
 }
 
-// TimeRange is a half-open [EarliestNs, LatestNs) window in nanoseconds
-// since the Unix epoch. Both values are int64; the wire layer reinterprets
-// the bits as varint.
+// TimeRange is a half-open [EarliestNs, LatestNs) window in
+// nanoseconds since the Unix epoch.
+//
+// Both fields are int64. The wire layer reinterprets the bit pattern
+// as uint64 via two's-complement (matching the server's
+// std::bit_cast<uint64_t>) and emits it as an unsigned LEB128 varint
+// — so any int64 including math.MinInt64 round-trips losslessly.
+// Relative-time expressions ("-15m", "now") are NOT understood by the
+// SDK or server; resolve them caller-side before populating the
+// fields.
+//
+// Use time.Time.UnixNano() to derive the values:
+//
+//	tr := &gnatrix.TimeRange{
+//	    EarliestNs: time.Now().Add(-1 * time.Hour).UnixNano(),
+//	    LatestNs:   time.Now().UnixNano(),
+//	}
+//
+// The server rejects latest < earliest with ERROR 2013
+// (QueryInvalidTimeRange) before binding a query_id; the SDK surfaces
+// that as *QueryRejectError on the first Next() call.
 type TimeRange struct {
 	EarliestNs int64
 	LatestNs   int64
