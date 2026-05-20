@@ -12,7 +12,7 @@ This is the **Go SDK for gnatrix** — a thin client library that dials a gnatri
 - **Slice 1.2** — session state machine: long-running reader goroutine that owns `conn.Read`, dispatches frames by type, enforces one-in-flight query client-side, routes ERROR 2011..2019 to active streams as `*QueryRejectError`, marks the session terminal on any other ERROR or malformed payload. Split internally into 1.2.1..1.2.6.
 - **Slice 1.3** — public Query API: `Client.Query`, `QueryStream.Next/Result/Close`, `parseEngineCode` for the `"NNNN: msg"` prefix in QUERY_END.message when status=2.
 
-Test counts (all green, `-race` clean): 43 root + 3 transport + 24 wire-codec. `go build ./...` clean.
+Test counts (all green, `-race` clean): 48 root + 3 transport + 28 wire-codec. `go build ./...` clean. Plus one Example function (`Example_query` in `example_test.go`) that compiles with `go test` but does not run (no `// Output:` — requires a real peer) and one integration test (`TestIntegration_WireCapture_RequestAndEnd` in `query_integration_test.go`, build tag `integration`) that talks to the real `gnatrixquery` server and skips when it is unreachable.
 
 **Deferred (not in Slice 1):**
 
@@ -39,20 +39,35 @@ Other targets: `vet`, `fmt`, `tidy`, `clean`. Single test: `GO=/usr/lib/go-1.22/
 ## Layout
 
 ```
-gnatrix.go                public package: Config, Client, Session, Dial, Ping, Close, query type declarations
+gnatrix.go                public package: Config, Client, Session, Dial, Ping, Close,
+                          query type declarations, c.terminating channel for dispatch escape
 gnatrix_test.go           Slice 0 end-to-end test with an in-memory fake gnatrixquery server
 readloop.go               session state machine: reader goroutine, dispatch, sessionFatal,
                           queryState slot + claim/clear, deliverPong/Row/End/Error
 readloop_test.go          dispatch-level unit tests (Slice 1.2): routing, CAS claim,
                           ERROR routing, session-fatal triggers; uses nopConn stub
 query.go                  public Query API: Client.Query, QueryStream.{Next,Result,Close},
-                          drain, parseEngineCode, ErrStreamClosed
+                          drain, parseEngineCode, ErrStreamClosed. Doc-comments are stdlib-style
+                          and exhaustive — keep them aligned when changing behavior.
 query_test.go             end-to-end query tests (Slice 1.3) using net.Pipe byte injection
+query_integration_test.go integration tests (build tag `integration`) against the real
+                          gnatrixquery: captureConn wraps the TLS conn to record TX/RX
+                          for cross-team byte validation; skips when peer unreachable.
+example_test.go           Example_query (package gnatrix_test) — full Dial → Query → Next →
+                          Result patron; compiles with `go test`, not runnable (no // Output:)
+README.md                 high-level overview + API surface; quickstart embedded
+QUERY_QUICKSTART.md       copy-paste-friendly onboarding for the query API; complements README
+testdata/wire_real/       byte captures from the live server via the integration test:
+                          query_request_live_frame.hex (34B emitted by SDK, accepted by server)
+                          query_end_live_frame.hex (39B emitted by server with status=7)
 internal/transport/       TLS 1.3 dial (DialTLS)
 internal/wire/            binary frame codec — one file per frame plus shared primitives
   frame.go                  Magic, Version, MaxPayload, FrameType, Header, AppendHeader/ReadHeader/ReadPayload
   varint.go                 AppendVarint / ReadVarint (LEB128)
-  string.go                 AppendLenStr / AppendLenBytes + Read counterparts
+  string.go                 AppendLenStr / AppendLenBytes + Read counterparts; ErrTruncated sentinel
+  errors.go                 ErrMalformed sentinel + wrapMalformed defer helper for the
+                            4 query decoders. All decoder rejections (truncation, invalid
+                            u8 boolean values, etc.) satisfy errors.Is(err, ErrMalformed).
   hello.go welcome.go error.go ping.go query.go ...
   testdata/                 golden hex fixtures: hello, welcome, query_request_{no,with}_timerange,
                             query_row, query_end_{ok,timeout}, query_progress
@@ -83,7 +98,9 @@ internal/wire/            binary frame codec — one file per frame plus shared 
 - `ErrQueryInFlight` — returned by `Query` when another query is active on the same `*Client`.
 - `ErrStreamClosed` — returned by `Next` after `Close`.
 
-These signatures are locked. Internals (frame routing, claim CAS, drainer goroutine) belong in `readloop.go` / `query.go` / `internal/`.
+**Doc-comments are stdlib-style and exhaustive.** `Query`, `QueryOptions`, `TimeRange`, `QueryStream`, `Next`, `Result`, `Close` carry full godoc with sections (`# Parameters`, `# Lifecycle contract`, `# Concurrency`, etc.) including a runnable-shaped code example on `QueryStream`. Keep these doc-comments aligned with any behavior change — they are part of the public contract, not just description.
+
+These signatures are locked. Internals (frame routing, claim CAS, drainer goroutine, `c.terminating` channel for dispatch escape, `internal/wire.ErrMalformed` for decoder rejections) belong in `readloop.go` / `query.go` / `internal/`.
 
 ## Contract properties verified by tests
 
@@ -134,6 +151,29 @@ The current suite locks down these behaviors. When refactoring, do not regress t
 - `Result()` panics if called before the stream terminated (`TestQueryStream_Result_PanicsBeforeDrain`).
 - `Next` respects a per-call ctx: a pre-canceled context surfaces as `context.Canceled` from `Next` (`TestQueryStream_Next_RespectsContextCancellation`).
 
+### Post-Slice-1 hardening
+
+- `ErrQueryInFlight` is returned **without writing any bytes to the wire** even under a generous ctx — verified by latency bound. `TestClientQuery_SecondQueryWhileFirstInFlight_RejectsWithoutIO` runs the rejected `Query` with a 1 s ctx and asserts elapsed < 50 ms. A regression that wrote before the CAS would either deadlock against the unread pipe or return `context.DeadlineExceeded` after ~1 s.
+- One-in-flight atomicity is sealed end-to-end through the public `Client.Query` (not only at the `tryClaimQuery` helper level): `TestClientQuery_ConcurrentCalls_OnlyOneSucceedsAtomically` fires N=20 goroutines through a start barrier; exactly one wins and 19 receive `ErrQueryInFlight`. The winning goroutine's wire write is drained from the server end of the pipe so it can complete; the winning stream is then closed by ending the query with `EndStatus=OK`.
+- Pre-execution rejection with code 2011 (`QuerySyntaxError`) keeps the session alive: after the reject, a follow-up `Query` claims the slot without `ErrQueryInFlight` and runs to a clean `io.EOF`. `TestClientQuery_SyntaxErrorReject_KeepsSessionAlive` also pins counter monotonicity under reject — the rejected attempt did not burn an extra `queryID` value (rejected QueryID=1; next successful Query gets QueryID=2, not 3).
+- Abandoned-iterator rescue: `TestClientQuery_AbandonedIteratorUnblocksReadLoopOnClientClose` validates the `c.terminating` channel escape in `deliverQueryRow`. After the caller consumes one row and walks away without Close, the dispatcher would be pinned on `q.rows<-msg` forever — conn.Close cannot rescue because it unblocks Read, not in-flight channel Sends. `Client.Close` closes `c.terminating` synchronously before the conn, so the dispatcher's select wakes immediately. The test deterministically forces the dispatcher into the blocking send (synchronous pipe write + 20 ms settle) and asserts `readDone` closes within 2 s; the regression check ran with the fix temporarily removed produced a deterministic 2 s timeout. `c.terminating` is initialized in three test fixtures (`newQueryFixture`, `newDispatchTestClient`, `dialWithCapture`) and in production `Dial`; forgetting it triggers a `panic: close of nil channel` on Close.
+
+### Slice 1.1 hardening — property tests and byte-exact pins
+
+- `TestQueryRequest_PropertyRoundTrip` exercises 1 000 PCG-seeded random `QueryRequestMsg` values (seed `(0xCAFEBABE, 0xDEADBEEF)` for reproducibility) plus 8 curated edge cases. For every input it asserts (a) `Encode → Decode → struct identical` (modulo the `HasTimeRange=false zeros EarliestNs/LatestNs` normalization), and (b) `Encode(Decode(Encode(in))) == Encode(in)` — the encoder is idempotent on its own output. Edge cases include `math.MinInt64`/`math.MaxInt64` ns timestamps, `math.MaxUint64`/`math.MaxUint32` unsigned fields, empty / minimal payloads, and 10 KB / 5 KB strings to exercise multi-byte varint length prefixes. A self-check anti-skip assertion fires if fewer than `iterations/8` iterations actually hit a negative timestamp (catches any regression that drops the negative path silently).
+- `TestSignedInt64NsTimestamp_MatchesServerEncoding` pins exact bytes for `earliest_ns`/`latest_ns` against the canonical two's-complement bit_cast + LEB128 contract: `0 → 00`, `1 → 01`, `-1 → ff ff ff ff ff ff ff ff ff 01`, `math.MinInt64 → 80 80 80 80 80 80 80 80 80 01`, `math.MaxInt64 → ff ff ff ff ff ff ff ff 7f`. That `-1` and `MinInt64` produce **distinct** sequences (both have the high bit set but the low bits differ) catches any implementation that uniformly collapses negatives. The sibling test `TestQueryRequest_SignedTimestamps_InFullFrame` reads back the same bytes from a full `EncodeQueryRequest` output, proving `Client.Query` actually routes through `AppendVarint(uint64(int64))` at both timestamp call sites. Cross-referenced to `server_client/src/query/frames.cpp:14` (`encode_i64_varint` uses `std::bit_cast<uint64_t>`); the test fails byte-exact if the Go path drifts from the C++ contract.
+
+### Decoder rejection contract — `internal/wire.ErrMalformed`
+
+- All decoder rejections from the 4 QUERY_* decoders satisfy `errors.Is(err, ErrMalformed)`. The sentinel is added at the function exit via `defer wrapMalformed(&err)` (Go 1.20+ double-%w wrapping) so the underlying cause (`io.ErrUnexpectedEOF`, `ErrTruncated`, custom "invalid value N" formatter) stays in the chain for granular diagnosis. Tests fortified to assert against the sentinel: `TestQueryEnd_TruncatedInvalidValue` (u8 truncated=0x02), `TestQueryRequest_HasTimeRangeInvalidValue` (u8 has_time_range=0x02).
+- `TestDecodeQuery_TruncatedPayloadsAreMalformed` (4 sub-tests, one per query frame) encodes a valid payload and iterates every truncation length from 0 to `len-1`, asserting (a) the decoder returns a non-nil error, and (b) the error satisfies `errors.Is(err, ErrMalformed)`. Covers all three truncation modes — mid-varint (`io.ErrUnexpectedEOF` wrapped), mid-lenstr (`ErrTruncated` wrapped), before-u8 (`io.ErrUnexpectedEOF` wrapped) — under one supertype. Mirror of the C++ `QueryRequestCodec.TruncatedPayloadFailsCleanly` test, extended from REQUEST to all 4 frames.
+
+### Integration / wire-capture against real gnatrixquery
+
+- `TestIntegration_WireCapture_RequestAndEnd` (build tag `integration`) talks to the real `gnatrixquery` server (defaults to `localhost:7777`, configurable via `GNATRIX_ADDR`/`GNATRIX_TOKEN`/`GNATRIX_TENANT`/`GNATRIX_CA_CERT`; skips with a clear message when the server is unreachable). `captureConn` wraps the `*tls.Conn` post-TLS-handshake under a mutex, recording every Read/Write into in-memory buffers. `dialWithCapture` mounts the wrap between `transport.DialTLS` and the gnatrix `handshake` (which was refactored from `*tls.Conn` to `net.Conn` for exactly this reason).
+- The test validates 4 cross-team properties against the bytes captured on both directions of the wire: (1) `DecodeQueryRequest(captured TX)` yields the struct the SDK constructed (round-trip-stable encoder); (2) `EncodeQueryRequest(decoded struct) == captured TX bytes` (the server accepted these exact bytes — no `MalformedString`/`InvalidFrame` rejection — so the server's decoder reads them too); (3) `DecodeQueryEnd(captured RX)` yields a sane struct (the SDK reads the server's bytes); (4) `EncodeQueryEnd(decoded END) == captured RX bytes` (round-trip-stable in both directions). The test also persists the captured bytes as goldens under `testdata/wire_real/` for forward use.
+- What is NOT validated today end-to-end (the live server returns `status=7 storage_unavailable` before reaching parse/plan/execution): `QUERY_ROW` streaming, `QUERY_PROGRESS` emit, `*QueryRejectError` pre-execution (codes 2011..2019). These remain covered by `net.Pipe` byte injection in unit tests.
+
 ## Encapsulation boundary
 
 Framing, varint encoding, TLS dial mechanics, session lifecycle, and the read loop / dispatcher are all hidden:
@@ -142,7 +182,8 @@ Framing, varint encoding, TLS dial mechanics, session lifecycle, and the read lo
 - Varint / lenstr / lenbytes encoding lives in `internal/wire/varint.go` and `string.go`. Same `internal/` lock.
 - Per-frame codecs (`HelloMsg`, `WelcomeMsg`, `ErrorMsg`, `QueryRequestMsg`, `QueryRowMsg`, `QueryEndMsg`, `QueryProgressMsg`, …) live in `internal/wire/` and are not part of the public surface; the SDK exposes only the parsed value types (`Session`, `Row`, `QueryResult`, etc.).
 - TLS dial mechanics live in `internal/transport/`. `Config.TLSConfig *tls.Config` is the **only** deliberate extension point — callers can inject CAs, ServerName, etc., but the `MinVersion=TLS13` pin in `transport.buildTLSConfig` cannot be disabled from outside.
-- The read loop, dispatcher, query slot, claim CAS, and `sessionFatal` are unexported (`readloop.go`). `Client.conn` is `net.Conn` for testability but is itself unexported and there is no public getter.
+- The read loop, dispatcher, query slot, claim CAS, `sessionFatal`, and the `c.terminating` channel (closed by `Client.Close` to wake any dispatcher pinned in an unbuffered send) are all unexported (`readloop.go`, `gnatrix.go`). `Client.conn` is `net.Conn` for testability but is itself unexported and there is no public getter.
+- Decoder rejection vocabulary is internal: `internal/wire.ErrMalformed` (sentinel for any malformed payload — truncation, invalid u8 boolean, varint overflow), `internal/wire.ErrTruncated` (lenstr declared length exceeds remaining buffer), `wrapMalformed` (the `defer`-applied wrap helper that ensures every QUERY_* decoder rejection satisfies `errors.Is(err, ErrMalformed)` without per-site churn). The public surface does not re-export these; callers that need the granular check use `errors.Is` against `wire.ErrMalformed` via the SDK's internal usage path, or rely on the wrapped errors in higher-level types (`*QueryError`, `*QueryRejectError`).
 - Session lifecycle is entirely behind `Dial` (create) → `Session()` (snapshot read) → `Query()` (claim) → `Close()` (idempotent teardown). There is no getter for the underlying conn and no method to re-handshake.
 
 When adding to the public surface, preserve this boundary — protocol details (frame types, byte layouts, varint encoding, dispatcher routing) must not leak through.

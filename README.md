@@ -10,6 +10,8 @@ Requires Go 1.22+. Zero external dependencies (stdlib only).
 **TL;DR for the query API:** see [QUERY_QUICKSTART.md](./QUERY_QUICKSTART.md)
 — copy-paste-friendly onboarding (Dial → Query → Next → Result) with
 error handling, TimeRange, pagination, and the lifecycle rules.
+For a runnable-shaped example with typed error recovery via `errors.As`,
+see `Example_query` in `example_test.go` (also rendered by godoc).
 
 ## Install
 
