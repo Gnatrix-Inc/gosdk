@@ -216,6 +216,80 @@ func TestClientQuery_PreExecutionReject_AsQueryRejectError(t *testing.T) {
 	}
 }
 
+// TestClientQuery_SyntaxErrorReject_KeepsSessionAlive specifically
+// pins ERROR code 2011 (QuerySyntaxError per wire-protocolv2.md
+// §ERROR) and verifies the invariant the spec calls out in §"Frame
+// ordering" (pre-execution rejection):
+//
+//	C: QUERY_REQUEST
+//	S: ERROR (2011 / 2012 / 2013 / 2018 / 2019)
+//	← session stays open, no QUERY_END for this request
+//
+// The sibling TestClientQuery_PreExecutionReject_AsQueryRejectError
+// covers the typed-error path with code 2014. This test layers two
+// stronger assertions on top:
+//
+//  1. Code 2011 surfaces verbatim as *QueryRejectError{Code:2011}.
+//  2. After the reject, a follow-up Query() claims the slot without
+//     ErrQueryInFlight and runs to a clean io.EOF — the session was
+//     not poisoned by the rejected request.
+//
+// QueryID monotonicity is also verified: the rejected query used
+// queryID=1 (counter advanced on a successful claim), so the next
+// successful query uses queryID=2, not 3 — proving the rejected
+// attempt did not burn an extra counter value either.
+func TestClientQuery_SyntaxErrorReject_KeepsSessionAlive(t *testing.T) {
+	f := newQueryFixture(t)
+
+	// First query: server replies with ERROR 2011 (syntax).
+	stream1, req1, err := f.issueQuery("badly !! parsed", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query #1: %v", err)
+	}
+	if req1.QueryID != 1 {
+		t.Errorf("req1.QueryID = %d; want 1 (counter starts at 1)", req1.QueryID)
+	}
+
+	f.writeFrame(wire.EncodeError(wire.ErrorMsg{
+		Code:    2011,
+		Message: "syntax error at column 7: unexpected '!!'",
+	}))
+
+	_, err = stream1.Next(context.Background())
+	var rej *QueryRejectError
+	if !errors.As(err, &rej) {
+		t.Fatalf("Next: got %T %v; want *QueryRejectError", err, err)
+	}
+	if rej.Code != 2011 {
+		t.Errorf("Code = %d; want 2011 (QuerySyntaxError)", rej.Code)
+	}
+	if rej.Message != "syntax error at column 7: unexpected '!!'" {
+		t.Errorf("Message = %q", rej.Message)
+	}
+	if stream1.Result() != nil {
+		t.Errorf("Result() after reject = %+v; want nil (no QUERY_END was emitted)", stream1.Result())
+	}
+
+	// Critical invariant: the session is still usable. A follow-up
+	// Query must claim the slot (no ErrQueryInFlight, because the
+	// rejected stream's Next() called clearActiveQuery) and complete
+	// cleanly.
+	stream2, req2, err := f.issueQuery("valid query", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query #2 (after syntax-error reject): %v", err)
+	}
+	if req2.QueryID != 2 {
+		t.Errorf("req2.QueryID = %d; want 2 (counter advanced; rejected Query #1 used qid=1)", req2.QueryID)
+	}
+	f.writeFrame(wire.EncodeQueryEnd(wire.QueryEndMsg{
+		QueryID: 2,
+		Status:  wire.QueryStatusOK,
+	}))
+	if _, err := stream2.Next(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("stream2 final Next: got %v; want io.EOF", err)
+	}
+}
+
 // ---- Post-execution errors --------------------------------------------
 
 func TestClientQuery_PostExecutionTimeout_AsQueryError(t *testing.T) {
