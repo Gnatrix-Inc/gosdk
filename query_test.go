@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -306,6 +307,116 @@ func TestClientQuery_SecondQueryWhileFirstInFlight_ReturnsErrQueryInFlight(t *te
 	f.writeFrame(wire.EncodeQueryEnd(wire.QueryEndMsg{QueryID: 2, Status: wire.QueryStatusOK}))
 	if _, err := stream2.Next(context.Background()); !errors.Is(err, io.EOF) {
 		t.Fatalf("stream2 final Next: %v", err)
+	}
+}
+
+// TestClientQuery_SecondQueryWhileFirstInFlight_RejectsWithoutIO seals
+// the contract that ErrQueryInFlight is returned **before** any bytes
+// hit the wire. The check is a latency bound: a correct implementation
+// returns purely from a mutex check (sub-millisecond on net.Pipe in
+// memory); a regression that tries to Write before checking would
+// either deadlock against the unread pipe or, with a deadline, return
+// context.DeadlineExceeded instead of ErrQueryInFlight after a much
+// longer wait. The 50ms cap is conservative — even under -race it
+// gives ~3 orders of magnitude headroom over a real mutex check.
+func TestClientQuery_SecondQueryWhileFirstInFlight_RejectsWithoutIO(t *testing.T) {
+	f := newQueryFixture(t)
+
+	stream1, _, err := f.issueQuery("first", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query #1: %v", err)
+	}
+	defer stream1.Close()
+
+	// Give the rejected Query a generous ctx. We expect a return time
+	// far below the deadline; the ctx is just a safety net so the test
+	// cannot hang if the contract is broken in a way that blocks on I/O.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = f.client.Query(ctx, "second", QueryOptions{})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrQueryInFlight) {
+		t.Fatalf("Query #2 error = %v (elapsed=%v); want ErrQueryInFlight", err, elapsed)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Query #2 took %v; expected <50ms (no I/O on rejection path)", elapsed)
+	}
+}
+
+// TestClientQuery_ConcurrentCalls_OnlyOneSucceedsAtomically exercises
+// the one-in-flight enforcement end-to-end through the public Query
+// API, not just the internal tryClaimQuery helper. N goroutines all
+// call Client.Query through a start barrier; exactly one must win and
+// the rest receive ErrQueryInFlight. The wire-write side of the
+// winning call is drained from the server end so the goroutine can
+// complete. This is the public-API parallel to
+// TestTryClaimQuery_ConcurrentClaims_OnlyOneWins in readloop_test.go.
+func TestClientQuery_ConcurrentCalls_OnlyOneSucceedsAtomically(t *testing.T) {
+	const n = 20
+	f := newQueryFixture(t)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var (
+		mu            sync.Mutex
+		wins          int
+		inFlight      int
+		otherErr      error
+		winningStream *QueryStream
+	)
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			s, err := f.client.Query(context.Background(), "race", QueryOptions{})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				wins++
+				winningStream = s
+			case errors.Is(err, ErrQueryInFlight):
+				inFlight++
+			default:
+				otherErr = err
+			}
+		}()
+	}
+	close(start)
+
+	// The winning goroutine writes a QUERY_REQUEST that we must drain
+	// from the server end of the pipe; otherwise the pipe write blocks
+	// and the goroutine never returns.
+	req := f.readRequest()
+
+	wg.Wait()
+
+	if otherErr != nil {
+		t.Fatalf("unexpected error from a racing Query: %v", otherErr)
+	}
+	if wins != 1 {
+		t.Errorf("wins = %d; want exactly 1 (only one Query may claim the slot)", wins)
+	}
+	if inFlight != n-1 {
+		t.Errorf("ErrQueryInFlight count = %d; want %d", inFlight, n-1)
+	}
+	if winningStream == nil {
+		t.Fatal("winningStream is nil — no goroutine claimed the slot")
+	}
+
+	// Close out the winning stream so the slot is freed and no goroutine
+	// (drainer, reader) leaks past the test.
+	f.writeFrame(wire.EncodeQueryEnd(wire.QueryEndMsg{
+		QueryID: req.QueryID,
+		Status:  wire.QueryStatusOK,
+	}))
+	if _, err := winningStream.Next(context.Background()); !errors.Is(err, io.EOF) {
+		t.Errorf("winning stream final Next: got %v; want io.EOF", err)
 	}
 }
 

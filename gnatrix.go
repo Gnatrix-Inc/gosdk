@@ -334,7 +334,7 @@ func (c *Client) Close() error {
 // handshake runs the gnatrix-level HELLO/WELCOME exchange on an already-
 // established TLS connection. It uses ctx's deadline when present and
 // otherwise falls back to cfg.HandshakeTimeout.
-func handshake(ctx context.Context, conn *tls.Conn, cfg Config, clientVersion string) (Session, error) {
+func handshake(ctx context.Context, conn net.Conn, cfg Config, clientVersion string) (Session, error) {
 	hsTimeout := cfg.HandshakeTimeout
 	if hsTimeout <= 0 {
 		hsTimeout = transport.DefaultHandshakeTimeout
