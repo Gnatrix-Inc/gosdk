@@ -2,6 +2,9 @@ package wire
 
 import (
 	"bytes"
+	"math"
+	"math/rand/v2"
+	"strings"
 	"testing"
 )
 
@@ -166,6 +169,175 @@ func TestQueryRequest_NegativeTimestamps_RoundTrip(t *testing.T) {
 	if decoded.LatestNs != -1_000_000_000 {
 		t.Errorf("LatestNs = %d; want -1_000_000_000", decoded.LatestNs)
 	}
+}
+
+// TestQueryRequest_PropertyRoundTrip exercises 1000 PCG-seeded random
+// QueryRequestMsg values plus a fixed set of boundary cases. For each
+// input it verifies three properties simultaneously:
+//
+//  1. Encode → Decode produces a struct identical to the input (modulo
+//     the documented "HasTimeRange=false zeroes EarliestNs/LatestNs"
+//     normalization, since those fields are not on the wire when the
+//     flag is unset).
+//  2. Re-encoding the decoded struct produces a byte sequence identical
+//     to the original — the encoder is idempotent over its own output.
+//  3. Negative int64 timestamps survive the two's-complement reinterpret
+//     (uint64 varint) round-trip. This is the bit_cast invariant; a
+//     regression that uses signed varint (zigzag) or truncates to
+//     uint32 would surface as elapsed bytes differing or sign loss.
+//
+// The PCG seed is fixed for reproducibility: a flake at iteration N
+// can be re-debugged by stopping at that index.
+func TestQueryRequest_PropertyRoundTrip(t *testing.T) {
+	const iterations = 1000
+	rng := rand.New(rand.NewPCG(0xCAFEBABE, 0xDEADBEEF))
+
+	// Boundary cases that random sampling almost never hits. Each
+	// must round-trip just like the random samples.
+	edgeCases := []QueryRequestMsg{
+		// int64 ns boundaries — the two's-complement extremes.
+		{QueryID: 1, HasTimeRange: true, EarliestNs: math.MinInt64, LatestNs: math.MaxInt64},
+		{QueryID: 2, HasTimeRange: true, EarliestNs: -1, LatestNs: 1},
+		{QueryID: 3, HasTimeRange: true, EarliestNs: 0, LatestNs: 0},
+		// uint boundaries.
+		{QueryID: math.MaxUint64, Limit: math.MaxUint64, ProgressIntervalMs: math.MaxUint32},
+		// Empty / minimal payload.
+		{},
+		// Long strings to exercise multi-byte varint length prefixes.
+		{QueryID: 7, QueryText: strings.Repeat("a", 10_000)},
+		{QueryID: 8, Cursor: strings.Repeat("c", 5_000), HasTimeRange: true},
+		// HasTimeRange with both timestamps at zero (still emitted on wire).
+		{QueryID: 9, HasTimeRange: true},
+	}
+
+	for i, msg := range edgeCases {
+		if err := assertQueryRequestRoundTrip(msg); err != nil {
+			t.Errorf("edge case %d (%+v): %v", i, msg, err)
+		}
+	}
+
+	negativeSeen := 0
+	for i := 0; i < iterations; i++ {
+		msg := randomQueryRequest(rng)
+		if msg.HasTimeRange && (msg.EarliestNs < 0 || msg.LatestNs < 0) {
+			negativeSeen++
+		}
+		if err := assertQueryRequestRoundTrip(msg); err != nil {
+			t.Fatalf("iter %d failed: %v\nmsg: %+v", i, err, msg)
+		}
+	}
+
+	// Sanity: with full int64 range sampling (~50% negative per field)
+	// and HasTimeRange ~50%, we expect a healthy fraction of iterations
+	// to actually hit the negative-timestamp branch. A regression that
+	// dropped the negative path entirely would make this assertion
+	// flag the missing coverage.
+	if negativeSeen < iterations/8 {
+		t.Errorf("only %d/%d iterations exercised negative timestamps; expected >= %d",
+			negativeSeen, iterations, iterations/8)
+	}
+}
+
+// assertQueryRequestRoundTrip is the property predicate shared by the
+// edge-case loop and the random loop. Returns nil on success.
+func assertQueryRequestRoundTrip(msg QueryRequestMsg) error {
+	encoded := EncodeQueryRequest(msg)
+	decoded, err := DecodeQueryRequest(bytes.NewReader(encoded[8:]))
+	if err != nil {
+		return decodeErr(err)
+	}
+
+	// HasTimeRange=false means EarliestNs/LatestNs are not on the wire
+	// and decode back as zero regardless of what was passed in. The
+	// encoder ignores them too. Normalize before comparing.
+	expected := msg
+	if !expected.HasTimeRange {
+		expected.EarliestNs = 0
+		expected.LatestNs = 0
+	}
+	if decoded != expected {
+		return structMismatch(decoded, expected)
+	}
+
+	reEncoded := EncodeQueryRequest(decoded)
+	if !bytes.Equal(encoded, reEncoded) {
+		return reEncodeMismatch(encoded, reEncoded)
+	}
+	return nil
+}
+
+func randomQueryRequest(rng *rand.Rand) QueryRequestMsg {
+	return QueryRequestMsg{
+		QueryID: rng.Uint64(),
+		// Strings capped short enough that 1000 iterations stay fast,
+		// but long enough to exercise multi-byte length prefixes.
+		IndexName:    randomBytes(rng, rng.IntN(64)),
+		QueryText:    randomBytes(rng, rng.IntN(512)),
+		Limit:        rng.Uint64(),
+		Cursor:       randomBytes(rng, rng.IntN(256)),
+		HasTimeRange: rng.IntN(2) == 1,
+		// Full int64 range via uint64 bit reinterpretation — this is
+		// exactly what the wire does. ~50% of values land negative,
+		// proving the two's-complement varint path.
+		EarliestNs:         int64(rng.Uint64()),
+		LatestNs:           int64(rng.Uint64()),
+		ProgressIntervalMs: uint32(rng.Uint32()),
+	}
+}
+
+// randomBytes returns a string of n bytes drawn from a printable
+// subset. Avoiding random bytes 0..31 keeps the test failure messages
+// legible when something goes wrong; the codec treats the bytes
+// opaquely (lenstr is length-prefixed) so the byte distribution does
+// not affect what is being tested.
+func randomBytes(rng *rand.Rand, n int) string {
+	if n == 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(32 + rng.IntN(95)) // printable ASCII 0x20..0x7e
+	}
+	return string(b)
+}
+
+// Small helpers so the predicate's return path is one line each.
+func decodeErr(err error) error               { return err }
+func structMismatch(got, want QueryRequestMsg) error {
+	return roundTripErr{Reason: "struct mismatch", Got: got, Want: want}
+}
+func reEncodeMismatch(orig, re []byte) error {
+	return roundTripErr{Reason: "re-encode bytes differ", OrigBytes: orig, ReBytes: re}
+}
+
+type roundTripErr struct {
+	Reason            string
+	Got, Want         QueryRequestMsg
+	OrigBytes, ReBytes []byte
+}
+
+func (e roundTripErr) Error() string {
+	if e.OrigBytes != nil {
+		return e.Reason + ": orig=" + hexCompact(e.OrigBytes) + " re=" + hexCompact(e.ReBytes)
+	}
+	return e.Reason
+}
+
+func hexCompact(b []byte) string {
+	const max = 64
+	if len(b) > max {
+		return hexEncode(b[:max]) + "..."
+	}
+	return hexEncode(b)
+}
+
+func hexEncode(b []byte) string {
+	const digits = "0123456789abcdef"
+	out := make([]byte, 0, len(b)*2)
+	for _, x := range b {
+		out = append(out, digits[x>>4], digits[x&0x0f])
+	}
+	return string(out)
 }
 
 // ---- QUERY_ROW ---------------------------------------------------------
