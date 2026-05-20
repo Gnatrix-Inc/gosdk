@@ -10,7 +10,7 @@ import (
 var welcomeAPITokenGolden = WelcomeMsg{
 	SessionID:          42,
 	ServerCapabilities: 0,
-	SessionExpiresAtMs: 1_700_000_000_000,
+	SessionExpiresAtSec: 1_700_000_000,
 	UserID:             [16]byte{0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55},
 	TenantID:           [16]byte{0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xcc, 0xcc, 0xdd, 0xdd, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee},
 	Permissions:        []string{"query:read", "query:write"},
@@ -53,8 +53,8 @@ func TestDecodeWelcome_APIToken_RoundTripsGolden(t *testing.T) {
 	if msg.ServerCapabilities != want.ServerCapabilities {
 		t.Errorf("ServerCapabilities = %d; want %d", msg.ServerCapabilities, want.ServerCapabilities)
 	}
-	if msg.SessionExpiresAtMs != want.SessionExpiresAtMs {
-		t.Errorf("SessionExpiresAtMs = %d; want %d", msg.SessionExpiresAtMs, want.SessionExpiresAtMs)
+	if msg.SessionExpiresAtSec != want.SessionExpiresAtSec {
+		t.Errorf("SessionExpiresAtSec = %d; want %d", msg.SessionExpiresAtSec, want.SessionExpiresAtSec)
 	}
 
 	// UUID byte-preservation: bytes.Equal on the raw 16-byte arrays —

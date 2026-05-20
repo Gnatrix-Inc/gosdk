@@ -14,8 +14,8 @@ type WelcomeMsg struct {
 	// ServerCapabilities is a bitmask; currently reserved (0).
 	ServerCapabilities uint64
 
-	// SessionExpiresAtMs is the session expiry as unix epoch milliseconds.
-	SessionExpiresAtMs uint64
+	// SessionExpiresAtSec is the session expiry as unix epoch seconds.
+	SessionExpiresAtSec uint64
 
 	// UserID is the 16-byte raw UUID of the authenticated user.
 	UserID [16]byte
@@ -37,9 +37,9 @@ func EncodeWelcome(msg WelcomeMsg) []byte {
 	var p []byte
 	p = AppendVarint(p, msg.SessionID)
 	p = AppendVarint(p, msg.ServerCapabilities)
-	p = AppendVarint(p, msg.SessionExpiresAtMs)
-	p = AppendLenBytes(p, msg.UserID[:])
-	p = AppendLenBytes(p, msg.TenantID[:])
+	p = AppendVarint(p, msg.SessionExpiresAtSec)
+	p = append(p, msg.UserID[:]...)
+	p = append(p, msg.TenantID[:]...)
 	p = AppendVarint(p, uint64(len(msg.Permissions)))
 	for _, perm := range msg.Permissions {
 		p = AppendLenStr(p, perm)
@@ -63,27 +63,16 @@ func DecodeWelcome(r io.Reader) (WelcomeMsg, error) {
 	if m.ServerCapabilities, err = ReadVarint(r); err != nil {
 		return m, fmt.Errorf("wire: welcome server_capabilities: %w", err)
 	}
-	if m.SessionExpiresAtMs, err = ReadVarint(r); err != nil {
-		return m, fmt.Errorf("wire: welcome session_expires_at_ms: %w", err)
+	if m.SessionExpiresAtSec, err = ReadVarint(r); err != nil {
+		return m, fmt.Errorf("wire: welcome session_expires_at_sec: %w", err)
 	}
 
-	uid, err := ReadLenBytes(r)
-	if err != nil {
+	if _, err = io.ReadFull(r, m.UserID[:]); err != nil {
 		return m, fmt.Errorf("wire: welcome user_id: %w", err)
 	}
-	if len(uid) != 16 {
-		return m, fmt.Errorf("wire: welcome user_id must be 16 bytes, got %d", len(uid))
-	}
-	copy(m.UserID[:], uid)
-
-	tid, err := ReadLenBytes(r)
-	if err != nil {
+	if _, err = io.ReadFull(r, m.TenantID[:]); err != nil {
 		return m, fmt.Errorf("wire: welcome tenant_id: %w", err)
 	}
-	if len(tid) != 16 {
-		return m, fmt.Errorf("wire: welcome tenant_id must be 16 bytes, got %d", len(tid))
-	}
-	copy(m.TenantID[:], tid)
 
 	count, err := ReadVarint(r)
 	if err != nil {

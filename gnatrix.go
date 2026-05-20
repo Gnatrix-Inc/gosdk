@@ -10,8 +10,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -32,9 +34,15 @@ type Config struct {
 	// TenantSlug names the tenant to log into.
 	TenantSlug string
 
+	// CACertPath is the path to a PEM-encoded CA certificate file used to
+	// verify the server's TLS certificate. When set, only this CA is trusted
+	// (system roots are not included). Mutually exclusive with TLSConfig.
+	CACertPath string
+
 	// TLSConfig optionally overrides the default TLS settings. When nil,
 	// the SDK uses system root CAs with ServerName set to the host of Addr.
 	// MinVersion is always pinned to TLS 1.3 (wire-protocol.md §Transport).
+	// Mutually exclusive with CACertPath.
 	TLSConfig *tls.Config
 
 	// DialTimeout caps the TCP dial. Defaults to 5s when zero.
@@ -101,12 +109,25 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, errors.New("gnatrix: Config.TenantSlug is required")
 	}
 
+	if cfg.CACertPath != "" && cfg.TLSConfig != nil {
+		return nil, errors.New("gnatrix: CACertPath and TLSConfig are mutually exclusive")
+	}
+
 	clientVersion := cfg.ClientVersion
 	if clientVersion == "" {
 		clientVersion = defaultClientVersion
 	}
 
-	conn, err := transport.DialTLS(ctx, cfg.Addr, cfg.TLSConfig, cfg.DialTimeout, cfg.HandshakeTimeout)
+	tlsCfg := cfg.TLSConfig
+	if cfg.CACertPath != "" {
+		tc, err := tlsConfigFromCA(cfg.CACertPath)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg = tc
+	}
+
+	conn, err := transport.DialTLS(ctx, cfg.Addr, tlsCfg, cfg.DialTimeout, cfg.HandshakeTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +252,7 @@ func handshake(ctx context.Context, conn *tls.Conn, cfg Config, clientVersion st
 			UserID:      welcome.UserID,
 			TenantID:    welcome.TenantID,
 			Permissions: welcome.Permissions,
-			ExpiresAt:   time.UnixMilli(int64(welcome.SessionExpiresAtMs)),
+			ExpiresAt:   time.Unix(int64(welcome.SessionExpiresAtSec), 0),
 			IssuedToken: welcome.IssuedToken,
 		}, nil
 
@@ -250,6 +271,20 @@ func handshake(ctx context.Context, conn *tls.Conn, cfg Config, clientVersion st
 	default:
 		return Session{}, fmt.Errorf("gnatrix: unexpected frame 0x%02x after HELLO", byte(hdr.Type))
 	}
+}
+
+// tlsConfigFromCA builds a tls.Config whose RootCAs pool contains only the
+// PEM-encoded certificate(s) in the file at path.
+func tlsConfigFromCA(path string) (*tls.Config, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("gnatrix: read CA cert %s: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("gnatrix: no valid PEM certificates in %s", path)
+	}
+	return &tls.Config{RootCAs: pool}, nil
 }
 
 // handshakeStageErr substitutes ctx.Err() when ctx was cancelled mid-stage,

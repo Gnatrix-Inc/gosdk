@@ -1,4 +1,4 @@
-.PHONY: build test vet fmt tidy run clean
+.PHONY: build test vet fmt tidy clean
 
 GO ?= go
 
@@ -16,9 +16,6 @@ fmt:
 
 tidy:
 	$(GO) mod tidy
-
-run:
-	$(GO) run ./cmd/example
 
 clean:
 	rm -rf bin dist coverage.txt

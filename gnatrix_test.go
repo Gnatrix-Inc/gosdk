@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gnatrix/gnatrix-gosdk/internal/wire"
+	"github.com/Gnatrix-Inc/gosdk/internal/wire"
 )
 
 const (
@@ -31,7 +31,7 @@ func TestDial_HappyPath_SessionPopulated(t *testing.T) {
 		validToken:      []byte(testToken),
 		welcome: wire.WelcomeMsg{
 			SessionID:          42,
-			SessionExpiresAtMs: uint64(time.Now().Add(time.Hour).UnixMilli()),
+			SessionExpiresAtSec: uint64(time.Now().Add(time.Hour).Unix()),
 			UserID:             [16]byte{0xaa},
 			TenantID:           [16]byte{0xbb},
 			Permissions:        []string{"query:read", "query:write"},
@@ -59,7 +59,7 @@ func TestDial_HelloAPIToken_ReturnsWelcome(t *testing.T) {
 		validToken:      []byte(testToken),
 		welcome: wire.WelcomeMsg{
 			SessionID:          7,
-			SessionExpiresAtMs: uint64(time.Now().Add(time.Hour).UnixMilli()),
+			SessionExpiresAtSec: uint64(time.Now().Add(time.Hour).Unix()),
 		},
 	})
 
@@ -204,7 +204,7 @@ func TestClient_Close_IsCleanAndIdempotent(t *testing.T) {
 		validToken:      []byte(testToken),
 		welcome: wire.WelcomeMsg{
 			SessionID:          1,
-			SessionExpiresAtMs: uint64(time.Now().Add(time.Hour).UnixMilli()),
+			SessionExpiresAtSec: uint64(time.Now().Add(time.Hour).Unix()),
 		},
 	})
 
@@ -260,7 +260,7 @@ func TestClient_Ping_ConcurrentCallsAreSerialized(t *testing.T) {
 		validToken:      []byte(testToken),
 		welcome: wire.WelcomeMsg{
 			SessionID:          99,
-			SessionExpiresAtMs: uint64(time.Now().Add(time.Hour).UnixMilli()),
+			SessionExpiresAtSec: uint64(time.Now().Add(time.Hour).Unix()),
 		},
 		pingResponseDelay: serverDelay,
 	})
@@ -309,7 +309,7 @@ func TestClient_Ping_RoundTrip(t *testing.T) {
 		validToken:      []byte(testToken),
 		welcome: wire.WelcomeMsg{
 			SessionID:          11,
-			SessionExpiresAtMs: uint64(time.Now().Add(time.Hour).UnixMilli()),
+			SessionExpiresAtSec: uint64(time.Now().Add(time.Hour).Unix()),
 		},
 	})
 

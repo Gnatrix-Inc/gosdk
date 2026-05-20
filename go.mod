@@ -1,3 +1,3 @@
-module github.com/gnatrix/gnatrix-gosdk
+module github.com/Gnatrix-Inc/gosdk
 
 go 1.22
