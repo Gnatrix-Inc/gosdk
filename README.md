@@ -7,6 +7,10 @@ queries (`Query` → `QueryStream`).
 
 Requires Go 1.22+. Zero external dependencies (stdlib only).
 
+**TL;DR for the query API:** see [QUERY_QUICKSTART.md](./QUERY_QUICKSTART.md)
+— copy-paste-friendly onboarding (Dial → Query → Next → Result) with
+error handling, TimeRange, pagination, and the lifecycle rules.
+
 ## Install
 
 ```
