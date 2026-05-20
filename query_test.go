@@ -30,8 +30,9 @@ func newQueryFixture(t *testing.T) *queryFixture {
 	t.Helper()
 	cConn, sConn := net.Pipe()
 	c := &Client{
-		conn:     cConn,
-		readDone: make(chan struct{}),
+		conn:        cConn,
+		readDone:    make(chan struct{}),
+		terminating: make(chan struct{}),
 	}
 	go c.readLoop()
 	t.Cleanup(func() {
@@ -491,6 +492,87 @@ func TestClientQuery_ConcurrentCalls_OnlyOneSucceedsAtomically(t *testing.T) {
 	}))
 	if _, err := winningStream.Next(context.Background()); !errors.Is(err, io.EOF) {
 		t.Errorf("winning stream final Next: got %v; want io.EOF", err)
+	}
+}
+
+// TestClientQuery_AbandonedIteratorUnblocksReadLoopOnClientClose
+// validates the c.terminating escape in deliverQueryRow. A caller
+// that iterates partially and then walks away (no defer stream.Close,
+// no drain to terminal) leaves the read loop blocked on
+// `q.rows <- msg` because the iterator's receiver is gone. Without
+// the terminating branch, even Client.Close cannot rescue: closing
+// the conn only unblocks pending Reads, not in-flight channel Sends.
+// The read loop would be pinned forever (goroutine leak) and readDone
+// would never close.
+//
+// With the fix, Client.Close synchronously closes c.terminating
+// BEFORE the conn — so a dispatcher mid-send picks the second
+// select branch immediately, returns, and the next loop iteration's
+// ReadHeader fails on the closed conn → readLoop returns →
+// readDone closes.
+//
+// The test is structured to FORCE the dispatcher into the blocking
+// send before Close is called. A naive version (just write rows and
+// hope) races: if Close beats the server-side row push, the SDK is
+// at ReadHeader (fails normally on conn close) and the
+// terminating-branch is never exercised. The test instead:
+//
+//  1. Caller consumes exactly one row.
+//  2. Test synchronously pushes a second row via f.writeFrame —
+//     net.Pipe is synchronous, so this returns only AFTER the SDK
+//     has read all 20 bytes (header + payload). The dispatcher has
+//     the msg in hand and is in or about to enter the blocking
+//     send on q.rows.
+//  3. A short sleep ensures the dispatcher has actually reached the
+//     select. Without the fix, after this point the dispatcher is
+//     pinned and conn.Close cannot rescue.
+//  4. Client.Close must wake the dispatcher within a short window.
+func TestClientQuery_AbandonedIteratorUnblocksReadLoopOnClientClose(t *testing.T) {
+	f := newQueryFixture(t)
+
+	stream, req, err := f.issueQuery("x", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+
+	// Push row 1 from a goroutine so caller's Next can consume it.
+	go func() {
+		_, _ = f.server.Write(wire.EncodeQueryRow(wire.QueryRowMsg{
+			QueryID: req.QueryID, RowSeq: 0, RowJSON: `{"i":1}`,
+		}))
+	}()
+
+	if _, err := stream.Next(context.Background()); err != nil {
+		t.Fatalf("Next #1: %v", err)
+	}
+
+	// Synchronously push row 2. Returns only after SDK has read all
+	// 20 bytes — at that point the dispatcher has the msg and is
+	// inside (or microseconds away from) deliverQueryRow's select.
+	f.writeFrame(wire.EncodeQueryRow(wire.QueryRowMsg{
+		QueryID: req.QueryID, RowSeq: 1, RowJSON: `{"i":2}`,
+	}))
+
+	// Give the dispatcher a moment to actually reach the select. With
+	// the fix, this is excessive (the select is reached in
+	// microseconds and the test still completes in <1ms after
+	// Client.Close). Without the fix, the sleep makes the test
+	// deterministic — the dispatcher is guaranteed to be blocked
+	// when Close fires.
+	time.Sleep(20 * time.Millisecond)
+
+	// Caller "forgot" to Close. Client.Close must terminate the read
+	// loop via the c.terminating signal.
+	if err := f.client.Close(); err != nil {
+		t.Fatalf("Client.Close: %v", err)
+	}
+
+	select {
+	case <-f.client.readDone:
+		// Read loop exited — fix is in place.
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not exit within 2s after Client.Close — " +
+			"deliverQueryRow is pinned on q.rows<-msg without escape")
 	}
 }
 

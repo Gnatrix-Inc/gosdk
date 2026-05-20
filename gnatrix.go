@@ -80,8 +80,19 @@ type Client struct {
 	readErr     error
 
 	// readDone is closed when readLoop exits. Used by waiters to fail
-	// fast when the connection has terminated.
+	// fast when the read loop itself has terminated (e.g. after the
+	// conn was closed and the next ReadHeader failed).
 	readDone chan struct{}
+
+	// terminating is closed synchronously by Client.Close BEFORE the
+	// conn is closed. Distinct from readDone because Close cannot
+	// rely on readDone to fire promptly: if readLoop is blocked
+	// inside a dispatch send (e.g. q.rows <- msg with the iterator
+	// abandoned), conn.Close will not unblock it — closing the conn
+	// only wakes pending Reads, not in-flight channel Sends. The
+	// dispatcher's select includes <-c.terminating so it can escape
+	// regardless of where it is.
+	terminating chan struct{}
 
 	// queryCounter generates QueryID values for QUERY_REQUEST frames.
 	// Monotonic, starts at 1 (the first Add(1) returns 1). Invisible to
@@ -253,9 +264,10 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		conn:     conn,
-		session:  session,
-		readDone: make(chan struct{}),
+		conn:        conn,
+		session:     session,
+		readDone:    make(chan struct{}),
+		terminating: make(chan struct{}),
 	}
 	go c.readLoop()
 	return c, nil
@@ -323,9 +335,16 @@ func pingTerminalErr(cause error) error {
 	return fmt.Errorf("gnatrix: ping: %w", cause)
 }
 
-// Close shuts down the underlying connection. Safe to call multiple times.
+// Close shuts down the underlying connection. Safe to call multiple
+// times. Closes c.terminating BEFORE c.conn so any dispatcher
+// currently blocked inside a channel send (e.g. an unbuffered
+// q.rows<-msg when the iterator was abandoned without Close) can
+// escape via the select branch on <-c.terminating. Without this
+// ordering, the read loop would remain pinned and readDone would
+// never close.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
+		close(c.terminating)
 		c.closeErr = c.conn.Close()
 	})
 	return c.closeErr

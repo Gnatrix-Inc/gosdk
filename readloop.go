@@ -140,16 +140,32 @@ func (c *Client) currentQuery() *queryState {
 // match (defensive — server should never send rows for a query the
 // client did not request).
 //
-// The send is blocking: if the iterator caller is not draining, the
-// dispatcher stalls here, TCP receive buffer fills, and the server
-// applies natural backpressure. This is the SDK's only throughput
+// The send blocks until either the iterator (or drainer, when the
+// stream has been Closed) consumes, OR Client.Close signals via
+// c.terminating. Without the second branch, an abandoned stream
+// (caller iterating without `defer stream.Close()` then walking
+// away) would pin the read loop here forever — even Client.Close
+// could not rescue it, because closing the conn only wakes pending
+// Reads, not in-flight channel Sends. terminating is closed
+// synchronously by Client.Close before the conn is closed, so the
+// select wakes up promptly and the read loop can exit cleanly.
+//
+// Backpressure is preserved on the happy path: with the iterator
+// alive, the send blocks until consumed and TCP backpressure
+// propagates to the server. This is the SDK's only throughput
 // control by design (see feedback_streaming_only.md).
 func (c *Client) deliverQueryRow(msg wire.QueryRowMsg) {
 	q := c.currentQuery()
 	if q == nil || q.queryID != msg.QueryID {
 		return
 	}
-	q.rows <- msg
+	select {
+	case q.rows <- msg:
+	case <-c.terminating:
+		// Client.Close was called; drop the row so the read loop can
+		// exit. The caller will observe the close via Next's own
+		// select on c.readDone after the loop returns.
+	}
 }
 
 // deliverQueryEnd sends msg to the in-flight query's end channel.

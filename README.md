@@ -79,6 +79,15 @@ loop themselves and accumulate into their own slice. The unbuffered rows
 channel inside the SDK propagates a slow consumer as TCP backpressure on
 the socket; that is the only throughput control.
 
+**Always `defer stream.Close()`** right after a successful `Query()`.
+The streaming iterator claims an internal one-in-flight slot on the
+`*Client`; that slot is released either by draining `Next()` to a
+terminal (`io.EOF` or a typed error) **or** by `Close()`. Calling
+both is harmless — `Close()` after a natural drain is a no-op. But
+abandoning the stream mid-iteration without `Close()` leaks the slot:
+every subsequent `Query()` on the same `*Client` returns
+`ErrQueryInFlight` until the connection is torn down.
+
 ### `Client.Query(ctx, queryText, opts) (*QueryStream, error)`
 
 Issues a `QUERY_REQUEST` and returns a stream. Generates a monotonic

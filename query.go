@@ -20,8 +20,22 @@ import (
 var ErrStreamClosed = errors.New("gnatrix: query stream closed")
 
 // QueryStream is the streaming result handle returned by Client.Query.
-// Callers must drain Next to io.EOF (or any non-nil error) or call
-// Close to release the in-flight slot on the *Client.
+//
+// Lifecycle contract — read carefully:
+//
+//   - Callers MUST either (a) drain Next to a terminal (io.EOF or any
+//     non-nil error), OR (b) call Close. The idiomatic pattern is
+//     `defer stream.Close()` immediately after a successful Query,
+//     which makes both cases safe: drain-to-terminal makes Close a
+//     no-op; mid-iteration return triggers the background drainer.
+//
+//   - Skipping both — iterating partially and abandoning the stream
+//     without Close — leaks the one-in-flight slot on the *Client.
+//     The dispatcher's send on q.rows escapes via the terminating
+//     channel that Client.Close signals before tearing the conn
+//     down, so Client.Close still terminates the read loop cleanly.
+//     But the slot stays claimed until then; subsequent Query()
+//     calls return ErrQueryInFlight until the next Dial.
 type QueryStream struct {
 	client *Client
 	state  *queryState

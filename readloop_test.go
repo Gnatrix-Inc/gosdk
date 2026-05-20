@@ -34,8 +34,9 @@ func (c *nopConn) SetWriteDeadline(t time.Time) error { return nil }
 // safe to call any I/O method on the returned client.
 func newDispatchTestClient() *Client {
 	return &Client{
-		conn:     &nopConn{},
-		readDone: make(chan struct{}),
+		conn:        &nopConn{},
+		readDone:    make(chan struct{}),
+		terminating: make(chan struct{}),
 	}
 }
 

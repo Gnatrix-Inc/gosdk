@@ -116,9 +116,10 @@ func dialWithCapture(t *testing.T, cfg Config) (*Client, *captureConn) {
 	}
 
 	c := &Client{
-		conn:     cap,
-		session:  session,
-		readDone: make(chan struct{}),
+		conn:        cap,
+		session:     session,
+		readDone:    make(chan struct{}),
+		terminating: make(chan struct{}),
 	}
 	go c.readLoop()
 
