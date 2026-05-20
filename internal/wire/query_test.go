@@ -340,6 +340,148 @@ func hexEncode(b []byte) string {
 	return string(out)
 }
 
+// TestSignedInt64NsTimestamp_MatchesServerEncoding pins the exact bytes
+// produced for signed-int64 ns timestamps (earliest_ns / latest_ns in
+// QUERY_REQUEST). The wire contract is:
+//
+//	server (server_client/src/query/frames.cpp:14):
+//	    void encode_i64_varint(std::int64_t v, std::vector<std::byte>& out) {
+//	        net::encode_varint(std::bit_cast<std::uint64_t>(v), out);
+//	    }
+//
+//	SDK (this file's sibling internal/wire/query.go, EncodeQueryRequest):
+//	    AppendVarint(p, uint64(msg.EarliestNs))
+//	    AppendVarint(p, uint64(msg.LatestNs))
+//
+// Go's int64→uint64 conversion is a bit-pattern reinterpret per the
+// language spec; C++ std::bit_cast<uint64_t> is the same operation.
+// LEB128 over the reinterpreted uint64 is then a deterministic byte
+// sequence. The expected bytes below are computed by hand from those
+// two rules and any divergence — sign-extension bug, zigzag varint
+// regression, uint32 truncation — surfaces as a byte mismatch.
+//
+// Decode side runs symmetrically: ReadVarint produces uint64, then
+// int64(uint64) reinterprets back. Round-trip equality is part of the
+// contract.
+func TestSignedInt64NsTimestamp_MatchesServerEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int64
+		want []byte
+	}{
+		{
+			name: "zero",
+			in:   0,
+			want: []byte{0x00},
+		},
+		{
+			name: "one",
+			in:   1,
+			want: []byte{0x01},
+		},
+		{
+			// int64(-1) → uint64(0xFFFFFFFFFFFFFFFF) → 10-byte LEB128
+			// of 64-bit all-ones: nine 0xff continuation bytes + 0x01
+			// for the top bit.
+			name: "minus_one",
+			in:   -1,
+			want: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01},
+		},
+		{
+			// math.MinInt64 = -2^63 → uint64(0x8000000000000000) → bit
+			// 63 set only. LEB128: nine 0x80 bytes (each carrying a
+			// continuation flag with zero payload) + 0x01 for bit 63.
+			// Distinct from -1 in byte-exact form, even though both
+			// have a high bit set.
+			name: "min_int64",
+			in:   math.MinInt64,
+			want: []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01},
+		},
+		{
+			// math.MaxInt64 = 2^63 - 1 → uint64(0x7FFFFFFFFFFFFFFF) →
+			// 63 ones. LEB128: eight 0xff + 0x7f (last byte has no
+			// continuation because bit 63 is 0). 9 bytes — one byte
+			// shorter than -1 because the high bit terminates the
+			// stream.
+			name: "max_int64",
+			in:   math.MaxInt64,
+			want: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Mirror what EncodeQueryRequest does for the ns timestamp
+			// fields at the source level.
+			got := AppendVarint(nil, uint64(tt.in))
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("encode int64(%d):\n got  %x\n want %x", tt.in, got, tt.want)
+			}
+
+			// Decode side: ReadVarint yields uint64; int64(u) reinterprets
+			// per spec. Verify the round-trip recovers the input bit-
+			// exact (no sign loss, no truncation).
+			back, err := ReadVarint(bytes.NewReader(got))
+			if err != nil {
+				t.Fatalf("ReadVarint: %v", err)
+			}
+			if int64(back) != tt.in {
+				t.Errorf("round-trip int64(%d): got %d", tt.in, int64(back))
+			}
+		})
+	}
+}
+
+// TestQueryRequest_SignedTimestamps_InFullFrame verifies that the
+// ns-timestamp encoding pinned above is the encoding the QUERY_REQUEST
+// encoder actually emits — i.e. that EncodeQueryRequest routes
+// earliest_ns and latest_ns through `AppendVarint(p, uint64(v))` and
+// not some other path. The test encodes a request with the boundary
+// timestamps and asserts that the expected byte sequences appear
+// verbatim in the payload at positions adjacent to the has_time_range
+// flag.
+func TestQueryRequest_SignedTimestamps_InFullFrame(t *testing.T) {
+	msg := QueryRequestMsg{
+		QueryID:      1,
+		IndexName:    "i",
+		QueryText:    "q",
+		HasTimeRange: true,
+		EarliestNs:   math.MinInt64,
+		LatestNs:     math.MaxInt64,
+	}
+
+	frame := EncodeQueryRequest(msg)
+	payload := frame[8:] // skip 8-byte header
+
+	// Locate the has_time_range byte. Preceding fields are:
+	//   varint(query_id=1)        = 0x01            (1 byte)
+	//   lenstr("i")               = 0x01 0x69       (2 bytes)
+	//   lenstr("q")               = 0x01 0x71       (2 bytes)
+	//   varint(limit=0)           = 0x00            (1 byte)
+	//   lenstr(cursor="")         = 0x00            (1 byte)
+	//                             total preamble    = 7 bytes
+	// Then: u8 has_time_range, varint earliest, varint latest, varint progress.
+	const preamble = 7
+	if got := payload[preamble]; got != 0x01 {
+		t.Fatalf("has_time_range = 0x%02x; want 0x01", got)
+	}
+
+	wantMin := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}
+	wantMax := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}
+
+	earliestStart := preamble + 1
+	earliestEnd := earliestStart + len(wantMin)
+	if got := payload[earliestStart:earliestEnd]; !bytes.Equal(got, wantMin) {
+		t.Errorf("earliest_ns(MinInt64) bytes:\n got  %x\n want %x", got, wantMin)
+	}
+
+	latestStart := earliestEnd
+	latestEnd := latestStart + len(wantMax)
+	if got := payload[latestStart:latestEnd]; !bytes.Equal(got, wantMax) {
+		t.Errorf("latest_ns(MaxInt64) bytes:\n got  %x\n want %x", got, wantMax)
+	}
+}
+
 // ---- QUERY_ROW ---------------------------------------------------------
 
 func TestEncodeQueryRow_MatchesGolden(t *testing.T) {
