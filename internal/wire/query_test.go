@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"math/rand/v2"
 	"strings"
@@ -643,8 +644,10 @@ func TestDecodeQueryEnd_Timeout_RoundTripsGolden(t *testing.T) {
 	}
 }
 
-// TestQueryEnd_TruncatedInvalidValue rejects bytes other than 0/1 in the
-// truncated slot.
+// TestQueryEnd_TruncatedInvalidValue rejects bytes other than 0/1 in
+// the truncated slot. The error must satisfy errors.Is(err,
+// ErrMalformed) so callers can catch all decoder rejections under one
+// sentinel.
 func TestQueryEnd_TruncatedInvalidValue(t *testing.T) {
 	good := EncodeQueryEnd(QueryEndMsg{QueryID: 1})
 	// Payload layout: varint(1)=01, varint(0)=00, varint(0)=00, varint(0)=00,
@@ -656,6 +659,9 @@ func TestQueryEnd_TruncatedInvalidValue(t *testing.T) {
 	_, err := DecodeQueryEnd(bytes.NewReader(corrupted[8:]))
 	if err == nil {
 		t.Fatal("DecodeQueryEnd accepted truncated=0x02; want error")
+	}
+	if !errors.Is(err, ErrMalformed) {
+		t.Errorf("errors.Is(err, ErrMalformed) = false; err = %v", err)
 	}
 }
 
@@ -715,8 +721,9 @@ func TestDecodeQueryProgress_RoundTripsGolden(t *testing.T) {
 	}
 }
 
-// TestQueryRequest_HasTimeRangeInvalidValue rejects bytes other than 0/1
-// in the has_time_range slot, matching the HELLO has_email contract.
+// TestQueryRequest_HasTimeRangeInvalidValue rejects bytes other than
+// 0/1 in the has_time_range slot, matching the HELLO has_email
+// contract, and surfaces as errors.Is(err, ErrMalformed).
 func TestQueryRequest_HasTimeRangeInvalidValue(t *testing.T) {
 	// Build a valid payload then corrupt the has_time_range byte to 0x02.
 	good := EncodeQueryRequest(QueryRequestMsg{QueryID: 1, IndexName: "x", QueryText: "y"})
@@ -729,5 +736,109 @@ func TestQueryRequest_HasTimeRangeInvalidValue(t *testing.T) {
 	_, err := DecodeQueryRequest(bytes.NewReader(corrupted[8:]))
 	if err == nil {
 		t.Fatal("DecodeQueryRequest accepted has_time_range=0x02; want error")
+	}
+	if !errors.Is(err, ErrMalformed) {
+		t.Errorf("errors.Is(err, ErrMalformed) = false; err = %v", err)
+	}
+}
+
+// TestDecodeQuery_TruncatedPayloadsAreMalformed mirrors the C++ server
+// test QueryRequestCodec.TruncatedPayloadFailsCleanly: encode a valid
+// frame, then for every truncation length 0..N-1 decode the prefix
+// and verify the decoder rejects cleanly via ErrMalformed. No panics,
+// no garbage structs returned.
+//
+// Run for the 4 query frames in scope of Slice 1 (REQUEST, ROW, END,
+// PROGRESS). The corresponding C++ test only covers REQUEST; this is
+// stricter.
+func TestDecodeQuery_TruncatedPayloadsAreMalformed(t *testing.T) {
+	tests := []struct {
+		name    string
+		encoded []byte
+		decode  func([]byte) error
+	}{
+		{
+			name: "QUERY_REQUEST",
+			encoded: EncodeQueryRequest(QueryRequestMsg{
+				QueryID:      1,
+				IndexName:    "i",
+				QueryText:    "q",
+				Limit:        1,
+				HasTimeRange: true,
+				EarliestNs:   1,
+				LatestNs:     2,
+			}),
+			decode: func(b []byte) error {
+				_, err := DecodeQueryRequest(bytes.NewReader(b))
+				return err
+			},
+		},
+		{
+			name: "QUERY_ROW",
+			encoded: EncodeQueryRow(QueryRowMsg{
+				QueryID: 1,
+				RowSeq:  0,
+				RowJSON: `{"x":1}`,
+			}),
+			decode: func(b []byte) error {
+				_, err := DecodeQueryRow(bytes.NewReader(b))
+				return err
+			},
+		},
+		{
+			name: "QUERY_END",
+			encoded: EncodeQueryEnd(QueryEndMsg{
+				QueryID:      1,
+				Status:       QueryStatusOK,
+				RowsReturned: 100,
+				NextCursor:   "p=2",
+				Message:      "done",
+			}),
+			decode: func(b []byte) error {
+				_, err := DecodeQueryEnd(bytes.NewReader(b))
+				return err
+			},
+		},
+		{
+			name: "QUERY_PROGRESS",
+			encoded: EncodeQueryProgress(QueryProgressMsg{
+				QueryID:       1,
+				EventsScanned: 10,
+				EventsMatched: 1,
+				SegmentsDone:  1,
+				SegmentsTotal: 5,
+				ElapsedMs:     250,
+			}),
+			decode: func(b []byte) error {
+				_, err := DecodeQueryProgress(bytes.NewReader(b))
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := tt.encoded[8:] // strip 8-byte header
+			if len(payload) < 2 {
+				t.Fatalf("test setup: payload too small (%d bytes)", len(payload))
+			}
+			// Cut at every offset from 0 (empty) through len-1 (one
+			// byte short). The full payload is the happy path and is
+			// covered by the existing golden tests, so skip it here.
+			for cut := 0; cut < len(payload); cut++ {
+				cut := cut
+				prefix := payload[:cut]
+				err := tt.decode(prefix)
+				if err == nil {
+					t.Errorf("cut=%d (%d bytes): decoder accepted truncated payload",
+						cut, len(prefix))
+					continue
+				}
+				if !errors.Is(err, ErrMalformed) {
+					t.Errorf("cut=%d: errors.Is(err, ErrMalformed) = false; err = %v",
+						cut, err)
+				}
+			}
+		})
 	}
 }

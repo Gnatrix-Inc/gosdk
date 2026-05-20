@@ -66,10 +66,11 @@ func EncodeQueryRequest(msg QueryRequestMsg) []byte {
 	return append(frame, p...)
 }
 
-// DecodeQueryRequest reads a QUERY_REQUEST payload from r.
-func DecodeQueryRequest(r io.Reader) (QueryRequestMsg, error) {
-	var m QueryRequestMsg
-	var err error
+// DecodeQueryRequest reads a QUERY_REQUEST payload from r. Any
+// rejection — truncation, u8 invalid value, varint overflow — surfaces
+// as an error satisfying errors.Is(err, ErrMalformed).
+func DecodeQueryRequest(r io.Reader) (m QueryRequestMsg, err error) {
+	defer wrapMalformed(&err)
 	if m.QueryID, err = ReadVarint(r); err != nil {
 		return m, fmt.Errorf("wire: query_request query_id: %w", err)
 	}
@@ -143,10 +144,10 @@ func EncodeQueryRow(msg QueryRowMsg) []byte {
 	return append(frame, p...)
 }
 
-// DecodeQueryRow reads a QUERY_ROW payload from r.
-func DecodeQueryRow(r io.Reader) (QueryRowMsg, error) {
-	var m QueryRowMsg
-	var err error
+// DecodeQueryRow reads a QUERY_ROW payload from r. Any rejection
+// surfaces as errors.Is(err, ErrMalformed).
+func DecodeQueryRow(r io.Reader) (m QueryRowMsg, err error) {
+	defer wrapMalformed(&err)
 	if m.QueryID, err = ReadVarint(r); err != nil {
 		return m, fmt.Errorf("wire: query_row query_id: %w", err)
 	}
@@ -199,10 +200,10 @@ func EncodeQueryEnd(msg QueryEndMsg) []byte {
 	return append(frame, p...)
 }
 
-// DecodeQueryEnd reads a QUERY_END payload from r.
-func DecodeQueryEnd(r io.Reader) (QueryEndMsg, error) {
-	var m QueryEndMsg
-	var err error
+// DecodeQueryEnd reads a QUERY_END payload from r. Any rejection
+// surfaces as errors.Is(err, ErrMalformed).
+func DecodeQueryEnd(r io.Reader) (m QueryEndMsg, err error) {
+	defer wrapMalformed(&err)
 	if m.QueryID, err = ReadVarint(r); err != nil {
 		return m, fmt.Errorf("wire: query_end query_id: %w", err)
 	}
@@ -283,10 +284,10 @@ func EncodeQueryProgress(msg QueryProgressMsg) []byte {
 	return append(frame, p...)
 }
 
-// DecodeQueryProgress reads a QUERY_PROGRESS payload from r.
-func DecodeQueryProgress(r io.Reader) (QueryProgressMsg, error) {
-	var m QueryProgressMsg
-	var err error
+// DecodeQueryProgress reads a QUERY_PROGRESS payload from r. Any
+// rejection surfaces as errors.Is(err, ErrMalformed).
+func DecodeQueryProgress(r io.Reader) (m QueryProgressMsg, err error) {
+	defer wrapMalformed(&err)
 	if m.QueryID, err = ReadVarint(r); err != nil {
 		return m, fmt.Errorf("wire: query_progress query_id: %w", err)
 	}
