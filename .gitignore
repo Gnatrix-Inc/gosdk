@@ -1,0 +1,21 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# Test & coverage
+*.test
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Env
+.env
+.env.local
