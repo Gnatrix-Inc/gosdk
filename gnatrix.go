@@ -13,8 +13,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Gnatrix-Inc/gosdk/internal/transport"
@@ -59,13 +61,32 @@ type Config struct {
 
 // Client is a live, authenticated connection to a gnatrixquery server.
 type Client struct {
-	conn    *tls.Conn
+	// conn is held as net.Conn so tests can substitute a stub. In
+	// production this is always *tls.Conn from transport.DialTLS; the
+	// TLS-specific API is not used after handshake.
+	conn    net.Conn
 	session Session
 
-	// mu serializes wire round-trips on conn. Without it, two concurrent
-	// Pings (or future post-handshake operations) would interleave their
-	// frame writes and reads on the same TLS stream.
+	// mu serializes wire writes on conn so concurrent Ping and (future)
+	// Query callers do not interleave their frame bytes. Reads are owned
+	// exclusively by readLoop and do not take this lock.
 	mu sync.Mutex
+
+	// waiterMu guards pingWaiter, activeQuery, and readErr. Held briefly
+	// by the read loop and by Ping/Query; never held across I/O.
+	waiterMu    sync.Mutex
+	pingWaiter  chan time.Time
+	activeQuery *queryState
+	readErr     error
+
+	// readDone is closed when readLoop exits. Used by waiters to fail
+	// fast when the connection has terminated.
+	readDone chan struct{}
+
+	// queryCounter generates QueryID values for QUERY_REQUEST frames.
+	// Monotonic, starts at 1 (the first Add(1) returns 1). Invisible to
+	// the caller; surfaced in QueryResult.QueryID for log correlation.
+	queryCounter atomic.Uint64
 
 	closeOnce sync.Once
 	closeErr  error
@@ -93,6 +114,99 @@ type AuthError struct {
 func (e *AuthError) Error() string {
 	return fmt.Sprintf("gnatrix: auth error %d: %s", e.Code, e.Message)
 }
+
+// ---- Query API (Slice 1) -----------------------------------------------
+//
+// Type declarations live here; method bodies for Client.Query and
+// QueryStream live in query.go.
+
+// QueryOptions configures a Client.Query call.
+type QueryOptions struct {
+	// IndexName names the target index, e.g. "logs-2026". Empty defaults
+	// to "default" at the Query call site.
+	IndexName string
+
+	// Limit is the maximum number of rows the client wants. 0 means no cap.
+	Limit uint64
+
+	// Cursor is an opaque pagination cursor from a previous QueryResult.
+	// Empty when starting a fresh query.
+	Cursor string
+
+	// TimeRange constrains the query to a half-open ns window. Nil means
+	// the server applies its default window.
+	TimeRange *TimeRange
+
+	// ProgressIntervalMs requests QUERY_PROGRESS cadence in milliseconds.
+	// 0 means use the server default (250 ms).
+	ProgressIntervalMs uint32
+}
+
+// TimeRange is a half-open [EarliestNs, LatestNs) window in nanoseconds
+// since the Unix epoch. Both values are int64; the wire layer reinterprets
+// the bits as varint.
+type TimeRange struct {
+	EarliestNs int64
+	LatestNs   int64
+}
+
+// Row is one streamed query result, decoded from the canonical JSON
+// payload of a QUERY_ROW frame.
+type Row = map[string]any
+
+// QueryResult carries the totals from the terminating QUERY_END frame.
+// Available only after Rows() has been fully drained.
+type QueryResult struct {
+	QueryID       uint64
+	RowsReturned  uint64
+	EventsScanned uint64
+	EventsMatched uint64
+	ElapsedMs     uint64
+	Truncated     bool
+	NextCursor    string
+}
+
+// QueryError is returned for query-level failures reported via QUERY_END
+// with a non-zero status. The session stays open after a QueryError;
+// the caller may issue another Query.
+//
+// Status values (see wire-protocolv2.md §QUERY_END):
+//
+//	1 = cancelled
+//	2 = engine_error              (EngineCode parsed from "NNNN: msg" prefix)
+//	3 = permission_denied
+//	4 = tenant_quota_exceeded
+//	5 = memory_limit_exceeded
+//	6 = timeout
+//	7 = storage_unavailable
+type QueryError struct {
+	Status     uint32
+	Message    string
+	EngineCode uint32
+	QueryID    uint64
+}
+
+func (e *QueryError) Error() string {
+	return fmt.Sprintf("gnatrix: query error status=%d code=%d: %s", e.Status, e.EngineCode, e.Message)
+}
+
+// QueryRejectError is returned for pre-execution rejections delivered as
+// an ERROR frame (codes 2011..2019). The session stays open; no QUERY_END
+// is emitted for the rejected request.
+type QueryRejectError struct {
+	Code    uint32
+	Message string
+}
+
+func (e *QueryRejectError) Error() string {
+	return fmt.Sprintf("gnatrix: query rejected %d: %s", e.Code, e.Message)
+}
+
+// ErrQueryInFlight is returned by Client.Query when another query is
+// already in flight on the same Client. The server enforces one
+// in-flight query per session (ERROR 2019); the SDK enforces it locally
+// so the second call fails before any bytes hit the wire.
+var ErrQueryInFlight = errors.New("gnatrix: query already in flight on this client")
 
 // Dial opens a TLS 1.3 connection to cfg.Addr, performs the HELLO/WELCOME
 // handshake using cfg.Token as an api_token credential, and returns a
@@ -138,7 +252,13 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{conn: conn, session: session}, nil
+	c := &Client{
+		conn:     conn,
+		session:  session,
+		readDone: make(chan struct{}),
+	}
+	go c.readLoop()
+	return c, nil
 }
 
 // Session returns the session minted by the server during Dial.
@@ -154,32 +274,53 @@ func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Fail fast if the read loop has already terminated (e.g. after Close).
+	select {
+	case <-c.readDone:
+		return 0, pingTerminalErr(c.terminalErr())
+	default:
+	}
+
+	waiter := make(chan time.Time, 1)
+	c.waiterMu.Lock()
+	c.pingWaiter = waiter
+	c.waiterMu.Unlock()
+	defer func() {
+		c.waiterMu.Lock()
+		c.pingWaiter = nil
+		c.waiterMu.Unlock()
+	}()
+
 	deadline, ok := ctx.Deadline()
 	if !ok || time.Until(deadline) > fallbackTimeout {
 		deadline = time.Now().Add(fallbackTimeout)
 	}
-	if err := c.conn.SetDeadline(deadline); err != nil {
-		return 0, fmt.Errorf("gnatrix: ping set deadline: %w", err)
-	}
-	defer c.conn.SetDeadline(time.Time{})
 
 	start := time.Now()
 	if _, err := c.conn.Write(wire.EncodePing()); err != nil {
 		return 0, fmt.Errorf("gnatrix: send ping: %w", err)
 	}
 
-	hdr, err := wire.ReadHeader(c.conn)
-	if err != nil {
-		return 0, fmt.Errorf("gnatrix: read pong: %w", err)
-	}
-	if hdr.Type != wire.FramePong {
-		return 0, fmt.Errorf("gnatrix: expected PONG (0x21), got 0x%02x", byte(hdr.Type))
-	}
-	if hdr.PayloadLen != 0 {
-		return 0, fmt.Errorf("gnatrix: PONG has non-zero payload (%d bytes)", hdr.PayloadLen)
-	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 
-	return time.Since(start), nil
+	select {
+	case <-waiter:
+		return time.Since(start), nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-c.readDone:
+		return 0, pingTerminalErr(c.terminalErr())
+	case <-timer.C:
+		return 0, fmt.Errorf("gnatrix: ping timeout after %s", time.Since(start))
+	}
+}
+
+func pingTerminalErr(cause error) error {
+	if cause == nil {
+		return errors.New("gnatrix: ping on closed client")
+	}
+	return fmt.Errorf("gnatrix: ping: %w", cause)
 }
 
 // Close shuts down the underlying connection. Safe to call multiple times.
