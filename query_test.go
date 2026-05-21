@@ -291,6 +291,64 @@ func TestClientQuery_SyntaxErrorReject_KeepsSessionAlive(t *testing.T) {
 	}
 }
 
+// TestClientQuery_EmptyQueryText_SurfaceAsSyntaxReject documents the
+// behavior when the caller passes an empty queryText. The SDK does
+// NOT validate client-side (consistent with the "no duplicate
+// pre-validation" rule in CLAUDE.md — the server is the source of
+// truth for query syntax). Specifically:
+//
+//  1. Query() returns *QueryStream, nil — no synchronous error.
+//  2. The wire frame carries QueryText="" verbatim (lenstr 0x00 in
+//     that position). The test asserts req.QueryText == "" decoded
+//     from the captured bytes, proving no client-side filtering.
+//  3. The real server rejects the empty query with ERROR 2011
+//     (QuerySyntaxError) before binding a query_id. The test
+//     simulates that response.
+//  4. stream.Next() returns *QueryRejectError{Code: 2011}.
+//  5. stream.Result() returns nil (no QUERY_END was emitted).
+//
+// Sibling test TestClientQuery_SyntaxErrorReject_KeepsSessionAlive
+// covers the session-alive invariant; this test focuses on
+// confirming the empty-string-is-not-filtered behavior + the typical
+// server surface.
+func TestClientQuery_EmptyQueryText_SurfaceAsSyntaxReject(t *testing.T) {
+	f := newQueryFixture(t)
+
+	stream, req, err := f.issueQuery("", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query (empty queryText): unexpected error: %v", err)
+	}
+	if req.QueryText != "" {
+		t.Errorf("req.QueryText = %q; want \"\" (SDK must not filter empty queries — server is the validator)", req.QueryText)
+	}
+	if req.QueryID != 1 {
+		t.Errorf("req.QueryID = %d; want 1 (counter starts at 1, must advance even for empty queryText)", req.QueryID)
+	}
+
+	// Simulate the server's response: ERROR 2011 with a message that
+	// reflects the empty-query rejection. The wire-protocol spec does
+	// not pin the exact server message text — only the code.
+	f.writeFrame(wire.EncodeError(wire.ErrorMsg{
+		Code:    2011,
+		Message: "empty query",
+	}))
+
+	_, err = stream.Next(context.Background())
+	var rej *QueryRejectError
+	if !errors.As(err, &rej) {
+		t.Fatalf("Next: got %T %v; want *QueryRejectError", err, err)
+	}
+	if rej.Code != 2011 {
+		t.Errorf("Code = %d; want 2011 (QuerySyntaxError)", rej.Code)
+	}
+	if rej.Message != "empty query" {
+		t.Errorf("Message = %q; want %q", rej.Message, "empty query")
+	}
+	if stream.Result() != nil {
+		t.Errorf("Result() after reject = %+v; want nil (no QUERY_END was emitted)", stream.Result())
+	}
+}
+
 // ---- Post-execution errors --------------------------------------------
 
 func TestClientQuery_PostExecutionTimeout_AsQueryError(t *testing.T) {
