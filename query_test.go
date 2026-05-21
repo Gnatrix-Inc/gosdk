@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Gnatrix-Inc/gosdk/internal/wire"
+	"go.uber.org/goleak"
 )
 
 // queryFixture wires a *Client to one end of a net.Pipe and exposes
@@ -454,6 +455,50 @@ func TestClientQuery_OversizedQueryText_ReturnsErrQueryTooLarge(t *testing.T) {
 	}
 }
 
+// TestClient_NoGoroutineLeakAfter100Queries seals the lifecycle of
+// the *Client and *QueryStream goroutines under repeated use: 100
+// queries each drained to io.EOF, each Closed, then Client.Close —
+// no goroutine spawned by the SDK survives.
+//
+// goleak.VerifyNone runs after t returns; it diffs the goroutine
+// list against a baseline taken at test entry and fails if any
+// extra goroutine remains. A regression that leaks the drainer
+// (e.g. a drain() that does not observe iterDoneCh) would surface
+// here as N=100 leaked goroutines with identical stack traces.
+//
+// The previous probe used runtime.NumGoroutine() which counts only
+// — goleak additionally prints the stack of each leaked goroutine
+// so the culprit is obvious.
+func TestClient_NoGoroutineLeakAfter100Queries(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	f := newQueryFixture(t)
+
+	for i := 0; i < 100; i++ {
+		stream, req, err := f.issueQuery("q", QueryOptions{})
+		if err != nil {
+			t.Fatalf("iter %d Query: %v", i, err)
+		}
+		f.writeFrame(wire.EncodeQueryEnd(wire.QueryEndMsg{
+			QueryID: req.QueryID,
+			Status:  wire.QueryStatusOK,
+		}))
+		if _, err := stream.Next(context.Background()); !errors.Is(err, io.EOF) {
+			t.Fatalf("iter %d Next: %v", i, err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("iter %d Close: %v", i, err)
+		}
+	}
+
+	// Explicit Client.Close to terminate the read loop. The fixture's
+	// t.Cleanup also calls Close (sync.Once-guarded), so the extra
+	// call is a no-op but makes the test's intent clear.
+	if err := f.client.Close(); err != nil {
+		t.Fatalf("Client.Close: %v", err)
+	}
+}
+
 // ---- One-in-flight enforcement ----------------------------------------
 
 func TestClientQuery_SecondQueryWhileFirstInFlight_ReturnsErrQueryInFlight(t *testing.T) {
@@ -635,6 +680,13 @@ func TestClientQuery_ConcurrentCalls_OnlyOneSucceedsAtomically(t *testing.T) {
 //     pinned and conn.Close cannot rescue.
 //  4. Client.Close must wake the dispatcher within a short window.
 func TestClientQuery_AbandonedIteratorUnblocksReadLoopOnClientClose(t *testing.T) {
+	// goleak: any goroutine that survives past Client.Close + readDone
+	// observation is a leak. The producer goroutine writing rows
+	// completes when its sConn.Write returns an error (peer closed)
+	// or all bytes are read; the dispatcher escapes via c.terminating;
+	// readLoop exits and closes readDone.
+	defer goleak.VerifyNone(t)
+
 	f := newQueryFixture(t)
 
 	stream, req, err := f.issueQuery("x", QueryOptions{})

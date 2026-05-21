@@ -5,7 +5,11 @@ server over TLS 1.3, authenticates with a `gnx_...` API token scoped to a
 tenant, and exposes a thin client for keepalive (`Ping`) and streaming
 queries (`Query` → `QueryStream`).
 
-Requires Go 1.22+. Zero external dependencies (stdlib only).
+Requires Go 1.22+. Zero runtime dependencies — the SDK itself uses
+only the Go standard library. `go.uber.org/goleak` is a single
+test-only dev dependency used by two goroutine-lifecycle tests; it is
+not pulled in by consumers (`go get github.com/Gnatrix-Inc/gosdk`
+does not download it).
 
 **TL;DR for the query API:** see [QUERY_QUICKSTART.md](./QUERY_QUICKSTART.md)
 — copy-paste-friendly onboarding (Dial → Query → Next → Result) with
