@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -402,6 +403,54 @@ func TestClientQuery_EngineError_ParsesEngineCodeFromPrefix(t *testing.T) {
 	}
 	if qerr.EngineCode != 2014 {
 		t.Errorf("EngineCode = %d; want 2014", qerr.EngineCode)
+	}
+}
+
+// TestClientQuery_OversizedQueryText_ReturnsErrQueryTooLarge seals
+// the wire-size pre-check in Client.Query: a queryText longer than
+// the wire MaxPayload (65 536 bytes) is rejected synchronously,
+// before any state allocation, slot claim, or counter increment.
+// The *Client is left in a pristine state — a follow-up Query with
+// a sane size must claim slot #1 (not #2), proving the rejected
+// call did not burn a queryID value.
+//
+// Without this check, the SDK would emit a frame with payload_len >
+// MaxPayload to the wire; the server rejects that as ERROR 1001
+// InvalidFrame and closes the session, killing the *Client. This
+// test verifies the rescue is in place.
+func TestClientQuery_OversizedQueryText_ReturnsErrQueryTooLarge(t *testing.T) {
+	f := newQueryFixture(t)
+
+	// Exactly one byte over the limit. The constant 65536 is the wire
+	// MaxPayload; queryText alone of size 65537 cannot fit in a
+	// single frame regardless of the other fields' overhead.
+	oversized := strings.Repeat("a", 65537)
+
+	stream, err := f.client.Query(context.Background(), oversized, QueryOptions{})
+	if stream != nil {
+		t.Errorf("Query returned non-nil stream alongside the error; want nil")
+	}
+	if !errors.Is(err, ErrQueryTooLarge) {
+		t.Fatalf("Query error = %v; want ErrQueryTooLarge", err)
+	}
+
+	// Side-effect check: slot must NOT be claimed, queryCounter must
+	// NOT have advanced. A follow-up Query with a sane size must
+	// proceed normally with queryID=1.
+	if f.client.currentQuery() != nil {
+		t.Error("currentQuery is non-nil after ErrQueryTooLarge — slot leaked")
+	}
+
+	stream2, req2, err := f.issueQuery("ok", QueryOptions{})
+	if err != nil {
+		t.Fatalf("follow-up Query: %v", err)
+	}
+	if req2.QueryID != 1 {
+		t.Errorf("req2.QueryID = %d; want 1 (counter must not advance on rejected oversize call)", req2.QueryID)
+	}
+	f.writeFrame(wire.EncodeQueryEnd(wire.QueryEndMsg{QueryID: 1, Status: wire.QueryStatusOK}))
+	if _, err := stream2.Next(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("stream2 final Next: %v", err)
 	}
 }
 

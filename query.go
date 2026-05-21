@@ -134,6 +134,9 @@ type QueryStream struct {
 //
 // # Errors returned directly by Query (vs via Next)
 //
+//   - ErrQueryTooLarge — queryText alone exceeds the wire frame
+//     limit (MaxPayload, 65 536 bytes). Checked first, before any
+//     state allocation or slot claim. The *Client is left untouched.
 //   - ErrQueryInFlight — another query is active on this *Client.
 //   - Wrapped session terminal (read loop already died, e.g. session
 //     was closed) — wrapped with "gnatrix: query: %w".
@@ -149,6 +152,19 @@ type QueryStream struct {
 // Always pair a successful Query with `defer stream.Close()`. See the
 // QueryStream lifecycle contract for the consequences of skipping it.
 func (c *Client) Query(ctx context.Context, queryText string, opts QueryOptions) (*QueryStream, error) {
+	// Conservative wire-size pre-check: any queryText longer than
+	// MaxPayload guarantees the encoded frame exceeds the wire-level
+	// limit and would be rejected by the server as ERROR 1001
+	// InvalidFrame (which closes the session — a footgun). Rejecting
+	// here keeps the *Client usable for retry with a trimmed query.
+	// The check runs before tryClaimQuery and before queryCounter.Add
+	// so a rejected oversize call burns neither the in-flight slot
+	// nor a queryID value.
+	if len(queryText) > wire.MaxPayload {
+		return nil, fmt.Errorf("gnatrix: queryText is %d bytes (limit %d): %w",
+			len(queryText), wire.MaxPayload, ErrQueryTooLarge)
+	}
+
 	indexName := opts.IndexName
 	if indexName == "" {
 		indexName = "default"

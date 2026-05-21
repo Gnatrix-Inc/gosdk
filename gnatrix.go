@@ -254,6 +254,39 @@ func (e *QueryRejectError) Error() string {
 // so the second call fails before any bytes hit the wire.
 var ErrQueryInFlight = errors.New("gnatrix: query already in flight on this client")
 
+// ErrQueryTooLarge is returned by Client.Query when the queryText
+// alone exceeds the wire frame payload limit (65 536 bytes).
+//
+// # What this catches
+//
+// The obvious footgun: queryText so large it cannot possibly fit in
+// a single wire frame regardless of the other fields' overhead.
+// Sending such a frame would be rejected by the server as ERROR
+// 1001 InvalidFrame and would close the session — killing the
+// *Client. Pre-rejecting client-side keeps the session alive.
+//
+// # What this does NOT catch
+//
+// A queryText shorter than MaxPayload but large enough that the
+// encoded frame, after adding the overhead from QueryID, IndexName,
+// Cursor and length-prefix varints, still exceeds MaxPayload. The
+// check is a conservative `len(queryText) > MaxPayload` precisely
+// to avoid duplicating the encoder's overhead math here; the gap
+// (between roughly MaxPayload − ~20 bytes and MaxPayload itself) is
+// uncovered. Frames in that band still go to the wire, the server
+// rejects them at the frame layer, and the *Client terminates.
+// Future tightening could pre-encode and measure (more allocation
+// but exact) — deferred.
+//
+// # Tenant-level cap is server-side
+//
+// The server enforces the per-tenant max_query_text_bytes (which
+// may be lower than MaxPayload) and surfaces overflow as
+// *QueryRejectError with code 2018 (QueryTooLarge) via Next. That
+// is a runtime quota check; ErrQueryTooLarge is purely the wire
+// floor.
+var ErrQueryTooLarge = errors.New("gnatrix: queryText exceeds wire frame size limit")
+
 // Dial opens a TLS 1.3 connection to cfg.Addr, performs the HELLO/WELCOME
 // handshake using cfg.Token as an api_token credential, and returns a
 // ready *Client. Auth failures (server ERROR code in 2001..2010) are
